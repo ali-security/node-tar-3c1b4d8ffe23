@@ -246,7 +246,9 @@ export interface TarOptions {
    * [MiniPass](http://npm.im/minipass)-based streams are designed for this use
    * case.
    */
-  transform?: (entry: ReadEntry) => ReadEntry
+  transform?: (
+    entry: ReadEntry,
+  ) => ReadEntry | null | undefined | false | 0 | ''
 
   /**
    * Call `chmod()` to ensure that extracted files match the entry's mode
