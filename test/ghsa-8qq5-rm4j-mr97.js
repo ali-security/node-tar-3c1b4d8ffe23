@@ -337,6 +337,27 @@ tap.test("CVE-2026-23745: relative symlink linkpath inside the target is preserv
   fs.createReadStream(tarFile).pipe(extractor)
 })
 
+// CVE-2026-31802: drive-prefix path cleaned via parts.join before resolve
+tap.test("CVE-2026-31802: drive-prefix path cleaned via parts.join before resolve", function (t) {
+  rimraf.sync(target)
+  var tarBuf = buildTar([
+    { path: "c:foo/inner.txt", type: "0", size: 0 }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", function () {
+      var expected = path.resolve(target, "foo/inner.txt")
+      var exists = false
+      try { fs.statSync(expected); exists = true } catch (e) {}
+      t.equal(exists, true,
+        "drive-prefix 'c:foo/inner.txt' should extract to target/foo/inner.txt after stripping")
+      t.end()
+    })
+
+  fs.createReadStream(tarFile).pipe(extractor)
+})
+
 tap.test("cleanup", function (t) {
   rimraf.sync(target)
   rimraf.sync(tarFile)
