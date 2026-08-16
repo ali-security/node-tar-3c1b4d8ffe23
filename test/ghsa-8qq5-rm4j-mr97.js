@@ -1008,6 +1008,216 @@ tap.test("CVE-2026-59875: a NUL-free PAX path override still applies",
   rs.pipe(extractor).on("error", finish)
 })
 
+// CVE-2026-59874: a *negative* size.  The size of an entry is what says when
+// that entry ends, and Entry.write() only ends it when _remaining reaches
+// exactly 0.  Counting down from below zero never gets there: every block
+// that follows is handed to the same entry forever, so the parser never looks
+// for another header, the rest of the archive disappears, and the stream ends
+// in an "unexpected eof" -- an unbounded loop over the input that yields
+// nothing.  A negative size can arrive three ways: as a base-256 field in the
+// 512-byte header block, as a PAX "size=-N" record in an extended header, or
+// as the same record in a global extended header.  All three are refused
+// here, and the pack side never writes such a record out either.
+
+var Entry = require("../lib/entry.js")
+var ExtendedHeader = require("../lib/extended-header.js")
+var ExtendedHeaderWriter = require("../lib/extended-header-writer.js")
+
+// run a PAX body through the extended-header state machine on its own, and
+// hand back the fields object it decoded into.
+function paxFields(body) {
+  var header = new TarHeader(makeHeader(
+    { path: "PaxHeaders/x", type: "x", size: body.length }))
+  var eh = new ExtendedHeader(header)
+  eh.write(new Buffer(body))
+  return eh.fields
+}
+
+// Overwrite the 12-byte size field of an encoded header block with a
+// base-256 negative number, the way GNU tar writes a value that the octal
+// field cannot hold: a 0xFF flag byte, then the two's complement of the
+// value, most significant byte first.  The checksum covers the whole block,
+// so it has to be recomputed once the bytes are in place.
+function setNegativeSize(block, n) {
+  var off = tar.fieldOffs[tar.fields.size]
+    , end = tar.fieldEnds[tar.fields.size]
+
+  for (var i = end - 1; i >= off; i--) {
+    var v = Math.floor(n / Math.pow(256, end - 1 - i))
+    block[i] = ((v % 256) + 256) % 256
+  }
+  block[off] = 0xFF
+
+  var sum = TarHeader.prototype.calcSum(block)
+    , oct = sum.toString(8)
+  while (oct.length < 6) oct = "0" + oct
+  block.write(oct + NUL + " ", tar.fieldOffs[tar.fields.cksum], 8, "utf8")
+
+  return block
+}
+
+// the record-level rule: a "size" record is stored only when it decodes to a
+// number that is zero or greater.  Every other key keeps its old behavior.
+tap.test("CVE-2026-59874: only a size of zero or more survives PAX decoding",
+         function (t) {
+  t.equal(paxFields(paxRecord("size", 1000)).size, 1000, "size=1000 is kept")
+  t.equal(paxFields(paxRecord("size", 0)).size, 0, "size=0 is kept")
+  t.equal(paxFields(paxRecord("size", -1)).hasOwnProperty("size"), false,
+    "size=-1 is dropped")
+  t.equal(paxFields(paxRecord("size", -1000)).hasOwnProperty("size"), false,
+    "size=-1000 is dropped")
+  t.equal(paxFields(paxRecord("size", -1000)).size, undefined,
+    "no size at all comes out of a negative record")
+  // the rule is about "size" only -- other numeric records are untouched.
+  t.equal(paxFields(paxRecord("uid", -1)).uid, -1, "uid=-1 is left alone")
+  t.end()
+})
+
+// the advisory's record, in a real tarball: it must not reach the fields
+// object, and the file that follows the PAX block must still be parsed.
+tap.test("CVE-2026-59874: a negative PAX size record is not stored",
+         function (t) {
+  var pax = paxRecord("size", -1000)
+  t.equal(pax, "14 size=-1000\n", "record is the advisory's shape")
+
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/neg", type: "x", size: pax.length, body: pax }
+    , { path: "real.txt", type: "0", size: 4, body: "REAL" }
+    ])
+
+  parsePaxTar(tarBuf, function (events, fields, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+
+    t.equal(fields.length, 1, "the extended header was parsed")
+    if (fields.length) {
+      t.equal(fields[0].hasOwnProperty("size"), false,
+        "the negative size never lands in the extended header fields")
+      t.equal(fields[0].size, undefined, "no size comes out of the PAX block")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file after the PAX block is still parsed")
+    if (real) {
+      t.equal(real.path, "real.txt", "the entry keeps its own path")
+      t.equal(real.size, 4, "the entry keeps the size from its own header")
+      t.equal(real.data, "REAL", "the entry body is read whole")
+    }
+    t.end()
+  })
+})
+
+// positive control: dropping negative sizes must not stop a legitimate PAX
+// size override from taking effect.
+tap.test("CVE-2026-59874: a non-negative PAX size record still applies",
+         function (t) {
+  var body = "REAL" + new Array(997).join("A")
+  var pax = paxRecord("size", 1000)
+  t.equal(body.length, 1000, "the body really is 1000 bytes")
+
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/pos", type: "x", size: pax.length, body: pax }
+    , { path: "pos.txt", type: "0", size: 4, body: body }
+    ])
+
+  parsePaxTar(tarBuf, function (events, fields, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+    t.equal(fields.length, 1, "the extended header was parsed")
+    if (fields.length) t.equal(fields[0].size, 1000, "size=1000 is stored")
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file entry is parsed")
+    if (real) {
+      t.equal(real.size, 1000, "the extended header size still applies")
+      t.equal(real.data, body, "the whole body is read")
+    }
+    t.end()
+  })
+})
+
+// the other source of a negative size: the raw 512-byte header block.
+tap.test("CVE-2026-59874: a negative size in the header block never reaches " +
+         "Entry._remaining", function (t) {
+  var block = setNegativeSize(
+    makeHeader({ path: "neg.txt", type: "0", size: 0 }), -1000)
+  t.ok(TarHeader.parseNumeric(block.slice(tar.fieldOffs[tar.fields.size],
+                                          tar.fieldEnds[tar.fields.size])) < 0,
+    "the crafted size field really does decode to a negative number")
+
+  var header = new TarHeader(block)
+  t.equal(header.cksumValid, true, "the crafted block is still a valid header")
+  t.equal(header.size, 0, "the negative base-256 size decodes as no size")
+
+  var entry = new Entry(header)
+  t.equal(entry.size, 0, "the entry gets no size")
+  t.equal(entry._remaining, 0, "_remaining starts at zero, so the entry ends")
+
+  // ... and when the negative size is layered on by an extended header or a
+  // global one, which is where a PAX record would land if one got through.
+  var ok = new TarHeader(makeHeader({ path: "ok.txt", type: "0", size: 4 }))
+  var ext = new Entry(ok, { size: -1000 })
+  t.equal(ext._remaining, 0,
+    "an extended header size below zero cannot make _remaining negative")
+  var gex = new Entry(ok, null, { size: -1000 })
+  t.equal(gex._remaining, 0,
+    "a global extended header size below zero cannot either")
+
+  // the ordinary case is untouched.
+  var plain = new Entry(ok)
+  t.equal(plain._remaining, 4, "a normal size still drives _remaining")
+  t.end()
+})
+
+// end to end: the entry with the negative size must not eat the entries that
+// come after it, and the parse must finish.
+tap.test("CVE-2026-59874: a negative header size does not swallow the rest " +
+         "of the archive", function (t) {
+  var head = setNegativeSize(
+    makeHeader({ path: "neg.txt", type: "0", size: 0 }), -1000)
+  var tarBuf = Buffer.concat(
+    [ head
+    , buildTar([{ path: "after.txt", type: "0", size: 4, body: "REAL" }])
+    ])
+
+  parseTar(tarBuf, function (events, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+    t.equal(events.length, 2, "both entries are reported")
+
+    var neg = events[0]
+    t.ok(neg, "the entry with the negative size is reported")
+    if (neg) {
+      t.equal(neg.path, "neg.txt", "it is the entry its header named")
+      t.equal(neg.size, 0, "its size is zero, not a negative number")
+    }
+
+    var after = events[1]
+    t.ok(after, "the entry after it is still parsed")
+    if (after) {
+      t.equal(after.path, "after.txt", "the following entry is not swallowed")
+      t.equal(after.data, "REAL", "and its body is read whole")
+    }
+    t.end()
+  })
+})
+
+// the pack side of the same rule: a negative size is never written into a
+// generated extended header, so this tar cannot hand one to another reader.
+tap.test("CVE-2026-59874: a negative size is never written into a generated " +
+         "extended header", function (t) {
+  var neg = new ExtendedHeaderWriter(
+    { path: "neg.txt", size: -1000, uid: 0, gid: 0 })
+  neg._encodeFields()
+  var body = Buffer.concat(neg.body).toString()
+  t.equal(body.indexOf("size="), -1,
+    "no size record is written out: " + JSON.stringify(body))
+
+  var pos = new ExtendedHeaderWriter(
+    { path: "pos.txt", size: 1000, uid: 0, gid: 0 })
+  pos._encodeFields()
+  t.notEqual(Buffer.concat(pos.body).toString().indexOf("size=1000"), -1,
+    "a size of zero or more is still written out")
+  t.end()
+})
+
 tap.test("cleanup", function (t) {
   rimraf.sync(target)
   rimraf.sync(tarFile)
