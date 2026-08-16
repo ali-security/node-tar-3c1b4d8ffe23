@@ -22,11 +22,27 @@ function makeHeader(props) {
   })
 }
 
+function zeroes(size) {
+  var buf = new Buffer(size)
+  for (var i = 0; i < size; i++) buf[i] = 0
+  return buf
+}
+
 function buildTar(entries) {
   var chunks = []
-  for (var i = 0; i < entries.length; i++) chunks.push(makeHeader(entries[i]))
-  chunks.push(new Buffer(1024))
-  for (var j = 0; j < 1024; j++) chunks[chunks.length - 1][j] = 0
+  for (var i = 0; i < entries.length; i++) {
+    chunks.push(makeHeader(entries[i]))
+    // optional entry body, padded out to whole 512-byte blocks
+    var body = entries[i].body
+    if (body) {
+      if (!Buffer.isBuffer(body)) body = new Buffer(body)
+      var padded = zeroes(Math.ceil(body.length / 512) * 512)
+      body.copy(padded)
+      chunks.push(padded)
+    }
+  }
+  // eof is two blocks of nulls
+  chunks.push(zeroes(1024))
   return Buffer.concat(chunks)
 }
 
@@ -527,6 +543,219 @@ tap.test("CVE-2026-26960: legitimate entries still extract alongside a recorded 
   var rs = fs.createReadStream(tarFile)
   rs.on("error", finish)
   rs.pipe(extractor).on("error", finish)
+})
+
+// CVE-2026-53655 (GHSA-vmf3-w455-68vh): tar file smuggling by applying a
+// pending PAX/GNU extended header to an intermediary metadata block.
+//
+// A PAX extended header describes the *next file entry*, not the metadata
+// blocks that may sit between it and that file.  node-tar used to apply the
+// pending fields to any block that was not one of the handful of types it
+// recognized as meta, so a crafted "size" record was honored by blocks such
+// as SparseFile / TapeVolumeHeader / SolarisACL / an unrecognized type flag.
+// Since the size decides where the next 512-byte header is looked for, that
+// let the block swallow the entries that followed: node-tar never saw them,
+// while GNU tar / libarchive / python tarfile did.
+
+// build a PAX record: "%d %s=%s\n", <length>, <keyword>, <value>
+// where <length> counts itself.
+function paxRecord(key, val) {
+  var tail = " " + key + "=" + val + "\n"
+  var len = tail.length + 1
+  while (String(len).length + tail.length > len) len++
+  return String(len) + tail
+}
+
+// run a tarball through tar.Parse() and collect everything it reports.
+function parseTar(tarBuf, cb) {
+  mkdirp.sync(path.dirname(tarFile))
+  fs.writeFileSync(tarFile, tarBuf)
+  var events = []
+  var errors = []
+  var parser = tar.Parse()
+
+  parser.on("*", function (ev, entry) {
+    var seen = { event: ev
+               , path: entry.props.path
+               , type: entry.props.type
+               , size: entry.props.size
+               , data: "" }
+    events.push(seen)
+    entry.on("data", function (c) { seen.data += c.toString() })
+  })
+  parser.on("error", function (er) { errors.push(er) })
+  parser.on("end", function () { cb(events, errors) })
+
+  // feed it by hand rather than with pipe(): pipe() tears itself down on the
+  // first "error", so a parser that desynchronizes would hang the test
+  // instead of failing it.
+  var rs = fs.createReadStream(tarFile)
+  rs.on("data", function (c) { parser.write(c) })
+  rs.on("end", function () { parser.end() })
+}
+
+function firstEvent(events, ev) {
+  for (var i = 0; i < events.length; i++) {
+    if (events[i].event === ev) return events[i]
+  }
+  return null
+}
+
+// every type flag that falls through to the "ignoredEntry" branch
+var smuggleTypes =
+  [ { type: "A", name: "SolarisACL" }
+  , { type: "I", name: "Inode" }
+  , { type: "M", name: "ContinuationFile" }
+  , { type: "S", name: "SparseFile" }
+  , { type: "V", name: "TapeVolumeHeader" }
+  , { type: "Q", name: "unrecognized type flag" }
+  ]
+
+smuggleTypes.forEach(function (meta) {
+  tap.test("CVE-2026-53655: extended header size is not applied to a " +
+           meta.name + " block", function (t) {
+    var pax = paxRecord("size", 1024)
+    var tarBuf = buildTar(
+      [ { path: "PaxHeaders/smuggle", type: "x", size: pax.length, body: pax }
+      , { path: "smuggle-" + meta.type, type: meta.type, size: 0 }
+      , { path: "real.txt", type: "0", size: 4, body: "REAL" }
+      ])
+
+    parseTar(tarBuf, function (events, errors) {
+      t.equal(errors.length, 0, "tarball parses without error")
+
+      var ignored = firstEvent(events, "ignoredEntry")
+      t.ok(ignored, meta.name + " block is seen as an ignored entry")
+      if (ignored) {
+        t.equal(ignored.size, 0,
+          meta.name + " keeps the size from its own header, not the PAX size")
+      }
+
+      var real = firstEvent(events, "entry")
+      t.ok(real, "the file after the " + meta.name +
+        " block is still parsed, not smuggled past the parser")
+      if (real) {
+        t.equal(real.path, "real.txt", "smuggled entry has the expected path")
+        t.equal(real.size, 4, "smuggled entry has its own size")
+        t.equal(real.data, "REAL", "smuggled entry has its own contents")
+      }
+      t.end()
+    })
+  })
+})
+
+// same smuggling primitive, driven by a global extended header, which sticks
+// around for the whole archive instead of just the next entry.
+tap.test("CVE-2026-53655: global extended header size is not applied to a " +
+         "SparseFile block", function (t) {
+  var gex = paxRecord("size", 1024)
+  var body = "REAL" + new Array(1021).join("A")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/global", type: "g", size: gex.length, body: gex }
+    , { path: "smuggle-S", type: "S", size: 0 }
+    , { path: "real.txt", type: "0", size: 4, body: body }
+    ])
+
+  parseTar(tarBuf, function (events, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+
+    var ignored = firstEvent(events, "ignoredEntry")
+    t.ok(ignored, "SparseFile block is seen as an ignored entry")
+    if (ignored) {
+      t.equal(ignored.size, 0,
+        "SparseFile keeps its own size, not the global extended header size")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file after the SparseFile block is still parsed")
+    if (real) {
+      t.equal(real.path, "real.txt", "smuggled entry has the expected path")
+      // normal fs entries still honor the global extended header
+      t.equal(real.size, 1024, "normal entry still honors the global header")
+      t.equal(real.data, body, "normal entry has its own contents")
+    }
+    t.end()
+  })
+})
+
+// GNU long path blocks are metadata too: they must be measured by their own
+// header, and must not stop the pending extended header from reaching the
+// file entry that follows them.
+tap.test("CVE-2026-53655: extended header size is not applied to a GNU " +
+         "long path block", function (t) {
+  var longPath = "gnu/long/path/name.txt"
+  var pax = paxRecord("size", 4) + paxRecord("path", "pax-path.txt")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/long", type: "x", size: pax.length, body: pax }
+    , { path: "././@LongLink", type: "L", size: longPath.length + 1
+      , body: longPath + "\0" }
+    , { path: "short.txt", type: "0", size: 4, body: "REAL" }
+    ])
+
+  parseTar(tarBuf, function (events, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+
+    var long = firstEvent(events, "longPath")
+    t.ok(long, "long path block is seen")
+    if (long) {
+      t.equal(long.size, longPath.length + 1,
+        "long path block keeps the size from its own header")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file after the long path block is still parsed")
+    if (real) {
+      t.equal(real.path, longPath, "long path still applies to the file")
+      t.equal(real.size, 4, "file size is unchanged")
+      t.equal(real.data, "REAL", "file contents are unchanged")
+    }
+    t.end()
+  })
+})
+
+// the fix must not stop extended headers from doing their job for the file
+// entries they actually describe.
+tap.test("CVE-2026-53655: extended header still applies to a normal file",
+         function (t) {
+  var pax = paxRecord("size", 10) + paxRecord("path", "pax-applied.txt")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/file", type: "x", size: pax.length, body: pax }
+    , { path: "short.txt", type: "0", size: 5, body: "HELLOWORLD" }
+    ])
+
+  parseTar(tarBuf, function (events, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+    var real = firstEvent(events, "entry")
+    t.ok(real, "file entry is parsed")
+    if (real) {
+      t.equal(real.path, "pax-applied.txt", "extended header path applies")
+      t.equal(real.size, 10, "extended header size applies")
+      t.equal(real.data, "HELLOWORLD", "whole body is read")
+    }
+    t.end()
+  })
+})
+
+// GNUDumpDir is a real file system entry, so it stays on the side of the
+// fence that does honor extended headers.
+tap.test("CVE-2026-53655: extended header still applies to a GNUDumpDir",
+         function (t) {
+  var pax = paxRecord("size", 10)
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/dump", type: "x", size: pax.length, body: pax }
+    , { path: "dumpdir/", type: "D", size: 5, body: "HELLOWORLD" }
+    ])
+
+  parseTar(tarBuf, function (events, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+    var real = firstEvent(events, "entry")
+    t.ok(real, "dump dir entry is parsed")
+    if (real) {
+      t.equal(real.size, 10, "extended header size applies to GNUDumpDir")
+      t.equal(real.data, "HELLOWORLD", "whole body is read")
+    }
+    t.end()
+  })
 })
 
 tap.test("cleanup", function (t) {

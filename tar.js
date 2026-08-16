@@ -103,6 +103,32 @@ Object.keys(types).forEach(function (t) {
   types[types[t]] = types[types[t]] || t
 })
 
+// types that are a normal file system entry, not metadata.
+//
+// These are the only ones that can be the subject of extended/globalExtended
+// headers, long path names, long linkpath names, etc.
+//
+// Any other type is meta, and must never be targetted by a pending extended
+// header.  Applying the pending fields (notably "size") to an intermediary
+// block moves where the next 512-byte header is expected, desynchronizing
+// this parser from other tar implementations, which lets entries be smuggled
+// past them.
+var normalFsTypes = {}
+;[ "0"  // File
+ , "\0" // OldFile
+ , ""   // OldFile
+ , "1"  // Link
+ , "2"  // SymbolicLink
+ , "3"  // CharacterDevice
+ , "4"  // BlockDevice
+ , "5"  // Directory
+ , "6"  // FIFO
+ , "7"  // ContiguousFile
+ , "D"  // GNUDumpDir
+ ].forEach(function (t) {
+  normalFsTypes[t] = true
+})
+
 // values for the mode field
 var modes =
   { suid: 04000 // set uid on extraction
@@ -162,6 +188,7 @@ exports.fieldSize = fieldSize
 exports.fieldOffs = fieldOffs
 exports.fieldEnds = fieldEnds
 exports.types = types
+exports.normalFsTypes = normalFsTypes
 exports.modes = modes
 exports.numeric = numeric
 exports.headerSize = headerSize
