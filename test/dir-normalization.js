@@ -26,7 +26,7 @@ var expectEntries = [
   { path: 'fixtures/the-chumbler',
     mode: '755',
     type: '2',
-    linkpath: path.resolve(target, 'a/b/c/d/the-chumbler'),
+    linkpath: 'a/b/c/d/the-chumbler' /* CVE-2026-23745: absolute linkpath roots are stripped, no longer rewritten to absolute */,
   },
   { path: 'fixtures/a/b/',
     mode: '755',
@@ -98,7 +98,7 @@ var expectFiles = [
     mode: '120755',
     type: 'SymbolicLink',
     depth: 2,
-    linkpath: path.resolve(target, 'a/b/c/d/the-chumbler')
+    linkpath: 'a/b/c/d/the-chumbler' /* CVE-2026-23745: absolute linkpath roots are stripped, no longer rewritten to absolute */
   }
 ]
 
