@@ -758,6 +758,256 @@ tap.test("CVE-2026-53655: extended header still applies to a GNUDumpDir",
   })
 })
 
+// CVE-2026-59875 (GHSA-gvwx-54wh-qm9j): a NUL byte inside a PAX extended
+// header *value* was kept verbatim, so a record such as
+//
+//   "26 path=safe.txt\0evil.txt\n"
+//
+// produced a JS string with a NUL in it.  GNU tar and bsdtar terminate the
+// string at the NUL and only ever see "safe.txt", so a validator that
+// pre-scans the tarball with either of them cannot see the smuggled tail
+// (CWE-436), and every fs call that receives the untruncated string --
+// fs.lstat(), fs.open(), fs.symlink() -- rejects it with an
+// ERR_INVALID_ARG_VALUE thrown from inside the async FSReqCallback chain,
+// i.e. outside any try/catch the caller wrapped the extraction in (CWE-248).
+//
+// The fix terminates the value at the first NUL while it is being decoded,
+// which is also where the GNU long path/linkpath blocks already do it.
+
+// a NUL, spelled out so that "\0" is never followed by a digit in a string
+// literal (where it would be read as the start of an octal escape).
+var NUL = String.fromCharCode(0)
+
+// like parseTar(), but also hands back the fields object that each extended
+// header ends up with -- that object is what a PAX value is decoded into, and
+// what parse.js hands on as the pending/global extended header.
+function parsePaxTar(tarBuf, cb) {
+  mkdirp.sync(path.dirname(tarFile))
+  fs.writeFileSync(tarFile, tarBuf)
+  var events = []
+  var fields = []
+  var errors = []
+  var parser = tar.Parse()
+
+  parser.on("*", function (ev, entry) {
+    var seen = { event: ev
+               , path: entry.props.path
+               , linkpath: entry.props.linkpath
+               , type: entry.props.type
+               , size: entry.props.size
+               , data: "" }
+    events.push(seen)
+    entry.on("data", function (c) { seen.data += c.toString() })
+    if (ev === "extendedHeader" || ev === "globalExtendedHeader") {
+      entry.on("end", function () { fields.push(entry.fields) })
+    }
+  })
+  parser.on("error", function (er) { errors.push(er) })
+  parser.on("end", function () { cb(events, fields, errors) })
+
+  // fed by hand rather than with pipe(), for the same reason as parseTar()
+  var rs = fs.createReadStream(tarFile)
+  rs.on("data", function (c) { parser.write(c) })
+  rs.on("end", function () { parser.end() })
+}
+
+// the upstream regression case, "12 path=x\0y\n" => path is "x"
+tap.test("CVE-2026-59875: a NUL terminates a PAX path value", function (t) {
+  var pax = paxRecord("path", "x" + NUL + "y")
+  t.equal(pax, "12 path=x" + NUL + "y\n", "record is the advisory's shape")
+
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/nul", type: "x", size: pax.length, body: pax }
+    , { path: "visible.txt", type: "0", size: 0 }
+    ])
+
+  parsePaxTar(tarBuf, function (events, fields, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+
+    t.equal(fields.length, 1, "the extended header was parsed")
+    if (fields.length) {
+      t.equal(fields[0].path, "x", "PAX value is terminated at the NUL")
+      t.equal(fields[0].path.indexOf(NUL), -1,
+        "no NUL survives into the decoded PAX value")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file entry is parsed")
+    if (real) {
+      t.equal(real.path, "x", "entry path is the truncated PAX path")
+      t.equal(real.path.indexOf(NUL), -1, "entry path holds no NUL byte")
+    }
+    t.end()
+  })
+})
+
+// linkpath is the other field the advisory names: it reaches fs.symlink()
+// and fs.link() the same way path reaches fs.open().
+tap.test("CVE-2026-59875: a NUL terminates a PAX linkpath value", function (t) {
+  var pax = paxRecord("linkpath", "a" + NUL + "b")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/nullink", type: "x", size: pax.length, body: pax }
+    , { path: "sym", type: "2", size: 0, linkpath: "placeholder" }
+    ])
+
+  parsePaxTar(tarBuf, function (events, fields, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+
+    t.equal(fields.length, 1, "the extended header was parsed")
+    if (fields.length) {
+      t.equal(fields[0].linkpath, "a", "PAX linkpath is terminated at the NUL")
+      t.equal(fields[0].linkpath.indexOf(NUL), -1,
+        "no NUL survives into the decoded PAX linkpath")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the symlink entry is parsed")
+    if (real) {
+      t.equal(real.linkpath, "a", "entry linkpath is the truncated PAX value")
+      t.equal(real.linkpath.indexOf(NUL), -1,
+        "entry linkpath holds no NUL byte")
+    }
+    t.end()
+  })
+})
+
+// this parser frames a record by its length, not by the \n, so a value may
+// legitimately contain a newline -- and therefore a second NUL after it.
+// Truncation has to take the whole tail, or that second NUL still gets out.
+tap.test("CVE-2026-59875: a NUL terminates a PAX value that spans a newline",
+         function (t) {
+  var pax = paxRecord("path", "a" + NUL + "b\nc" + NUL + "d")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/multi", type: "x", size: pax.length, body: pax }
+    , { path: "visible.txt", type: "0", size: 0 }
+    ])
+
+  parsePaxTar(tarBuf, function (events, fields, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+
+    t.equal(fields.length, 1, "the extended header was parsed")
+    if (fields.length) {
+      t.equal(fields[0].path, "a", "value is cut at the *first* NUL")
+      t.equal(fields[0].path.indexOf(NUL), -1,
+        "no later NUL survives into the decoded PAX value")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file entry is parsed")
+    if (real) t.equal(real.path.indexOf(NUL), -1, "entry path holds no NUL byte")
+    t.end()
+  })
+})
+
+// truncating before the numeric coercion must leave numeric records working.
+tap.test("CVE-2026-59875: a NUL-terminated numeric PAX value still parses",
+         function (t) {
+  var pax = paxRecord("size", "4" + NUL + "999")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/num", type: "x", size: pax.length, body: pax }
+    , { path: "num.txt", type: "0", size: 4, body: "REAL" }
+    ])
+
+  parsePaxTar(tarBuf, function (events, fields, errors) {
+    t.equal(errors.length, 0, "tarball parses without error")
+    if (fields.length) {
+      t.equal(fields[0].size, 4, "numeric PAX value is cut at the NUL")
+    }
+
+    var real = firstEvent(events, "entry")
+    t.ok(real, "the file entry is parsed")
+    if (real) {
+      t.equal(real.size, 4, "entry keeps the truncated size, not 4999")
+      t.equal(real.data, "REAL", "entry body is read whole")
+    }
+    t.end()
+  })
+})
+
+// the advisory's own PoC, run all the way through an extraction: the process
+// must survive it, only the visible name may be created, and the smuggled
+// tail must not appear on disk.
+tap.test("CVE-2026-59875: extracting a NUL-smuggled PAX path does not throw",
+         function (t) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+
+  var pax = paxRecord("path", "safe.txt" + NUL + "evil.txt")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/poc", type: "x", size: pax.length, body: pax }
+    , { path: "placeholder.txt", type: "0", size: 0 }
+    ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish(er) {
+    if (done) return
+    done = true
+    t.equal(er, undefined, "extraction reports no error")
+
+    var safe = false
+    try { fs.lstatSync(path.resolve(target, "safe.txt")); safe = true } catch (e) {}
+    t.equal(safe, true, "the visible name is the one that gets created")
+
+    var evil = false
+    try { fs.lstatSync(path.resolve(target, "evil.txt")); evil = true } catch (e) {}
+    t.equal(evil, false, "the smuggled name is not created")
+
+    var names = fs.readdirSync(target)
+    for (var i = 0; i < names.length; i++) {
+      t.equal(names[i].indexOf(NUL), -1,
+        "no extracted name carries a NUL byte: " + JSON.stringify(names[i]))
+    }
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", function () { finish() })
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+})
+
+// positive control: a PAX path override with no NUL in it still applies, so
+// the truncation cannot be over-firing on legitimate archives.
+tap.test("CVE-2026-59875: a NUL-free PAX path override still applies",
+         function (t) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+
+  var pax = paxRecord("path", "foo/bar.txt")
+  var tarBuf = buildTar(
+    [ { path: "PaxHeaders/ok", type: "x", size: pax.length, body: pax }
+    , { path: "orig.txt", type: "0", size: 0 }
+    ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish(er) {
+    if (done) return
+    done = true
+    t.equal(er, undefined, "extraction reports no error")
+
+    var overridden = false
+    try { fs.lstatSync(path.resolve(target, "foo/bar.txt")); overridden = true }
+    catch (e) {}
+    t.equal(overridden, true, "PAX path override still names the file")
+
+    var orig = false
+    try { fs.lstatSync(path.resolve(target, "orig.txt")); orig = true } catch (e) {}
+    t.equal(orig, false, "the header path was really overridden")
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", function () { finish() })
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+})
+
 tap.test("cleanup", function (t) {
   rimraf.sync(target)
   rimraf.sync(tarFile)
