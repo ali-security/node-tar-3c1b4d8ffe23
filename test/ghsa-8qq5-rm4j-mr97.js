@@ -358,6 +358,177 @@ tap.test("CVE-2026-31802: drive-prefix path cleaned via parts.join before resolv
   fs.createReadStream(tarFile).pipe(extractor)
 })
 
+function runChainExploitTest(t, linkType, typeName) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+  var exploitedName = "exploited-" + typeName + "-" + process.pid + ".txt"
+  var exploitedFile = path.resolve(target, "..", exploitedName)
+  fs.writeFileSync(exploitedFile, "original content")
+
+  var tarBuf = buildTar([
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/b/up", type: "2", linkpath: "../.." },
+    { path: "a/b/escape", type: "2", linkpath: "up/.." },
+    { path: "exploit", type: linkType, linkpath: "a/b/escape/" + exploitedName }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish() {
+    if (done) return
+    done = true
+    try { fs.writeFileSync(path.resolve(target, "exploit"), "pwned") } catch (e) {}
+    t.equal(fs.readFileSync(exploitedFile, 'utf8'), "original content",
+      "external exploited-file must NOT be modified via " + typeName + " chain")
+    try { fs.unlinkSync(exploitedFile) } catch (e) {}
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", finish)
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+}
+
+tap.test("CVE-2026-26960: symlink chain exploit blocked (Link type)", function (t) {
+  runChainExploitTest(t, "1", "Link")
+})
+
+tap.test("CVE-2026-26960: symlink chain exploit blocked (SymbolicLink type)", function (t) {
+  runChainExploitTest(t, "2", "SymbolicLink")
+})
+
+// CVE-2026-26960: the advisory's own PoC shape.  Each hop of the chain passes the
+// string-based containment check on its own (a/b/c/up resolves to a, a/b/escape
+// resolves to a/b), but on disk a/b/escape lands above the extraction dir, and the
+// hardlink target is resolved through it.
+tap.test("CVE-2026-26960: advisory PoC hardlink through a two-hop symlink chain is blocked", function (t) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+  var secretName = "cve26960-poc-secret-" + process.pid + ".txt"
+  var secretFile = path.resolve(target, "..", secretName)
+  fs.writeFileSync(secretFile, "ORIGINAL DATA")
+  var secretInode = fs.lstatSync(secretFile).ino
+
+  var tarBuf = buildTar([
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/b/c/", type: "5", mode: 0755 },
+    { path: "a/b/c/up", type: "2", linkpath: "../.." },
+    { path: "a/b/escape", type: "2", linkpath: "c/up/../.." },
+    { path: "exfil", type: "1", linkpath: "a/b/escape/" + secretName }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish() {
+    if (done) return
+    done = true
+    var exfil = path.resolve(target, "exfil")
+    try {
+      t.notEqual(fs.lstatSync(exfil).ino, secretInode,
+        "exfil must not share an inode with the external secret")
+    } catch (e) {
+      t.pass("exfil was not created at all (symlink chain blocked)")
+    }
+    try { fs.writeFileSync(exfil, "OVERWRITTEN") } catch (e) {}
+    t.equal(fs.readFileSync(secretFile, 'utf8'), "ORIGINAL DATA",
+      "external secret must NOT be modified through the symlink chain")
+    try { fs.unlinkSync(secretFile) } catch (e) {}
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", finish)
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+})
+
+// CVE-2026-26960: a plain file entry nested under the escaping symlink must not be
+// written through it either — the escape is not limited to link entries.
+tap.test("CVE-2026-26960: plain file entry cannot be written through a symlink chain", function (t) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+  var pocName = "cve26960-through-" + process.pid + ".txt"
+  var outside = path.resolve(target, "..", pocName)
+  try { fs.unlinkSync(outside) } catch (e) {}
+
+  var tarBuf = buildTar([
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/b/up", type: "2", linkpath: "../.." },
+    { path: "a/b/escape", type: "2", linkpath: "up/.." },
+    { path: "a/b/escape/" + pocName, type: "0", size: 0 }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish() {
+    if (done) return
+    done = true
+    var escaped = false
+    try { fs.lstatSync(outside); escaped = true } catch (e) {}
+    t.equal(escaped, false,
+      "file entry must not be written outside the extraction dir through the symlink chain")
+    try { fs.unlinkSync(outside) } catch (e) {}
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", finish)
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+})
+
+// CVE-2026-26960 regression guard: recording a symlink must not block its siblings
+// or any other legitimate in-tree entry.
+tap.test("CVE-2026-26960: legitimate entries still extract alongside a recorded symlink", function (t) {
+  rimraf.sync(target)
+  mkdirp.sync(target)
+
+  var tarBuf = buildTar([
+    { path: "a/", type: "5", mode: 0755 },
+    { path: "a/x", type: "0", size: 0 },
+    { path: "a/b/", type: "5", mode: 0755 },
+    { path: "a/b/y", type: "2", linkpath: "../x" },
+    { path: "a/b/z", type: "0", size: 0 }
+  ])
+  fs.writeFileSync(tarFile, tarBuf)
+
+  var done = false
+  function finish() {
+    if (done) return
+    done = true
+    var xExists = false
+    try { fs.lstatSync(path.resolve(target, "a/x")); xExists = true } catch (e) {}
+    t.equal(xExists, true, "a/x still extracted")
+    try {
+      t.equal(fs.readlinkSync(path.resolve(target, "a/b/y")), "../x",
+        "legitimate in-tree symlink still created")
+    } catch (err) {
+      t.fail("legitimate in-tree symlink should have been created: " + err.message)
+    }
+    var zExists = false
+    try { fs.lstatSync(path.resolve(target, "a/b/z")); zExists = true } catch (e) {}
+    t.equal(zExists, true, "sibling of a recorded symlink still extracted")
+    t.end()
+  }
+
+  var extractor = tar.Extract({ path: target })
+    .on("end", finish)
+    .on("error", finish)
+  var rs = fs.createReadStream(tarFile)
+  rs.on("error", finish)
+  rs.pipe(extractor).on("error", finish)
+})
+
 tap.test("cleanup", function (t) {
   rimraf.sync(target)
   rimraf.sync(tarFile)
