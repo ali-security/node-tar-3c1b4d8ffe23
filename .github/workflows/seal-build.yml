@@ -1,0 +1,39 @@
+name: seal-build
+
+on: workflow_dispatch
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 4 (release-era npm 2) via nvm
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+          . "$HOME/.nvm/nvm.sh"
+          nvm install 4
+          nvm use 4
+          node -v
+          npm -v
+
+      - name: npm pack
+        run: |
+          . "$HOME/.nvm/nvm.sh"
+          nvm use 4
+          rm -rf /tmp/build
+          mkdir -p /tmp/build/package
+          cp -r "$GITHUB_WORKSPACE"/. /tmp/build/package/
+          cd /tmp/build/package
+          rm -rf .git .github node_modules
+          npm pack
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp tar-2.2.1.tgz "$GITHUB_WORKSPACE/dist/"
+          tar tzf "$GITHUB_WORKSPACE/dist/tar-2.2.1.tgz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tar-2.2.1-tgz
+          path: dist/tar-2.2.1.tgz
+          if-no-files-found: error
